@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-injection_guard.py - детектор скрытых закладок (prompt injection) в документах.
+injection_guard.py v1.1 - детектор скрытых закладок (prompt injection).\nФорматы: docx/dotx/docm, xlsx/xlsm/xltx, pptx/potx/ppsx, pdf, txt/прочее.
 
 Запуск:
     python3 injection_guard.py файл.docx [файл2.pdf ...]
@@ -188,6 +188,144 @@ def scan_docx(path):
     return findings, joined
 
 
+# ---------------------------------------------------------------------- XLSX
+
+SS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+def scan_xlsx(path):
+    findings = []
+    texts = []
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        # 1. Скрытые листы
+        if "xl/workbook.xml" in names:
+            try:
+                root = ET.fromstring(z.read("xl/workbook.xml"))
+                for sh in root.iter(SS + "sheet"):
+                    st = sh.get("state")
+                    if st in ("hidden", "veryHidden"):
+                        lvl = "ОЧЕНЬ СКРЫТЫЙ (veryHidden)" if st == "veryHidden" else "скрытый"
+                        findings.append(("workbook.xml", "%s лист: '%s'"
+                                         % (lvl, sh.get("name")), ""))
+                for dn in root.iter(SS + "definedName"):
+                    if dn.text and len(dn.text.strip()) > 60:
+                        findings.append(("workbook.xml", "длинное definedName",
+                                         dn.text[:300]))
+                        texts.append(dn.text)
+            except ET.ParseError:
+                pass
+        # 2. Общие строки + inline-строки + скрытые строки/столбцы
+        if "xl/sharedStrings.xml" in names:
+            try:
+                root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for t in root.iter(SS + "t"):
+                    if t.text:
+                        texts.append(t.text)
+            except ET.ParseError:
+                pass
+        for n in names:
+            if n.startswith("xl/worksheets/") and n.endswith(".xml"):
+                try:
+                    root = ET.fromstring(z.read(n))
+                except ET.ParseError:
+                    continue
+                hid_r = sum(1 for r in root.iter(SS + "row")
+                            if r.get("hidden") == "1" or r.get("hidden") == "true")
+                hid_c = sum(1 for c in root.iter(SS + "col")
+                            if c.get("hidden") == "1" or c.get("hidden") == "true")
+                if hid_r:
+                    findings.append((n, "скрытых строк: %d" % hid_r, ""))
+                if hid_c:
+                    findings.append((n, "скрытых столбцов: %d" % hid_c, ""))
+                for t in root.iter(SS + "t"):
+                    if t.text:
+                        texts.append(t.text)
+        # 3. Стили: белый/микрошрифт (эвристика по styles.xml)
+        if "xl/styles.xml" in names:
+            raw = z.read("xl/styles.xml").decode("utf-8", "ignore")
+            for m in re.finditer(r'rgb="FF(F[0-9A-F]F[0-9A-F]F[0-9A-F])"', raw):
+                findings.append(("styles.xml",
+                                 "белый/почти белый шрифт в стилях #%s" % m.group(1),
+                                 "сопоставить с ячейками вручную"))
+                break
+            for m in re.finditer(r'<sz val="([0-9.]+)"/>', raw):
+                try:
+                    if float(m.group(1)) <= 4:
+                        findings.append(("styles.xml",
+                                         "микрокегль %s pt в стилях" % m.group(1), ""))
+                        break
+                except ValueError:
+                    pass
+        # 4. Примечания, надписи, метаданные, VBA
+        for n in names:
+            if re.match(r"xl/comments\d*\.xml", n) or "threadedComments" in n:
+                try:
+                    root = ET.fromstring(z.read(n))
+                    for t in root.iter():
+                        if t.tag.endswith("}t") and t.text:
+                            texts.append(t.text)
+                    findings.append((n, "файл примечаний к ячейкам (текст включён в проверку)", ""))
+                except ET.ParseError:
+                    pass
+            if n.startswith("xl/drawings/") and n.endswith(".xml"):
+                raw = z.read(n).decode("utf-8", "ignore")
+                for m in re.finditer(r"<a:t>([^<]{1,500})</a:t>", raw):
+                    texts.append(m.group(1))
+            if "vbaProject" in n:
+                findings.append((n, "МАКРОСЫ (vbaProject)", ""))
+        for meta in ("docProps/core.xml", "docProps/app.xml", "docProps/custom.xml"):
+            if meta in names:
+                try:
+                    root = ET.fromstring(z.read(meta))
+                    for el in root.iter():
+                        if el.text and len(el.text.strip()) > 40:
+                            findings.append((meta, "длинный текст в метаданных",
+                                             el.text.strip()[:300]))
+                            texts.append(el.text)
+                except ET.ParseError:
+                    pass
+    joined = "\n".join(texts)
+    findings += scan_unicode(joined, "xlsx:текст")
+    findings += scan_lexical(joined, "xlsx:текст")
+    return findings, joined
+
+
+# ---------------------------------------------------------------------- PPTX
+
+def scan_pptx(path):
+    findings = []
+    texts = []
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        for n in names:
+            if (n.startswith("ppt/slides/") or n.startswith("ppt/notesSlides/")) \
+                    and n.endswith(".xml"):
+                raw = z.read(n).decode("utf-8", "ignore")
+                if 'show="0"' in raw and n.startswith("ppt/slides/"):
+                    findings.append((n, "СКРЫТЫЙ слайд", ""))
+                for m in re.finditer(r"<a:t>([^<]{1,500})</a:t>", raw):
+                    texts.append(m.group(1))
+                if n.startswith("ppt/notesSlides/"):
+                    pass  # заметки уже в texts - проверяются лексикой
+            if "vbaProject" in n:
+                findings.append((n, "МАКРОСЫ (vbaProject)", ""))
+        for meta in ("docProps/core.xml", "docProps/app.xml", "docProps/custom.xml"):
+            if meta in names:
+                try:
+                    root = ET.fromstring(z.read(meta))
+                    for el in root.iter():
+                        if el.text and len(el.text.strip()) > 40:
+                            findings.append((meta, "длинный текст в метаданных",
+                                             el.text.strip()[:300]))
+                            texts.append(el.text)
+                except ET.ParseError:
+                    pass
+    joined = "\n".join(texts)
+    findings += scan_unicode(joined, "pptx:текст")
+    findings += scan_lexical(joined, "pptx:текст")
+    return findings, joined
+
+
 # ----------------------------------------------------------------------- PDF
 
 def scan_pdf(path):
@@ -238,7 +376,7 @@ def report(path, findings, clean_text, dump_clean=False):
     else:
         crit = [f for f in findings
                 if any(k in f[1] for k in ("vanish", "белый", "Tr 3", "Tr 7",
-                                           "Unicode Tags", "кегль", "микрокегль",
+                                           "Unicode Tags", "кегль", "микрокегль", "veryHidden", "ОЧЕНЬ СКРЫТЫЙ",
                                            "макросы"))]
         print("[!] Находок: %d (из них структурно критичных: %d)\n"
               % (len(findings), len(crit)))
@@ -271,6 +409,10 @@ def main(argv):
         ext = os.path.splitext(path)[1].lower()
         if ext in (".docx", ".dotx", ".docm"):
             f, t = scan_docx(path)
+        elif ext in (".xlsx", ".xlsm", ".xltx"):
+            f, t = scan_xlsx(path)
+        elif ext in (".pptx", ".potx", ".ppsx"):
+            f, t = scan_pptx(path)
         elif ext == ".pdf":
             f, t = scan_pdf(path)
         else:
