@@ -81,7 +81,8 @@ def check(seg, label):
                     warn_hits.append((name, note.strip()[:160]))
                     break
     print('=' * 74)
-    print('НОРМА:', label, '| приміток {} у тексті:', len(re.findall(r'\{[^}]+\}', flat)))
+    print('НОРМА:', label, '| приміток у фігурних дужках:',
+          len(re.findall(r'\{[^}]+\}', flat)))
     if crit_hits:
         print('ВЕРДИКТ: [СТОП] – критичних маркерів:', len(crit_hits))
         for name, note in crit_hits:
