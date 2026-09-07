@@ -9,9 +9,10 @@ watch_downloads.py v1.0 (07.09.2026) - карантин-лаборатория �
 
 Запуск (Windows, без зависимостей кроме Python; oletools - по желанию):
     python watch_downloads.py                       # следит за %USERPROFILE%\\Downloads
-    python watch_downloads.py "D:\\Почта\\Вложения"   # другая папка
+                                                    # и за подпапками из EXTRA_SUBDIRS (Telegram Desktop)
+    python watch_downloads.py "D:\\Почта\\Вложения"   # другая папка (можно перечислить несколько)
 Ключи:
-    --quarantine   опасные файлы переносить в Downloads\\_КАРАНТИН\\ с суффиксом .blocked
+    --quarantine   опасные файлы переносить в _КАРАНТИН\\ первой (главной) папки с суффиксом .blocked
     --defender     дополнительно вызывать Windows Defender (MpCmdRun) на каждый файл
     --all          показывать окно и на ЧИСТО (по умолчанию - только УВАГА/НЕБЕЗПЕЧНО)
     --telegram     слать вердикт в Telegram; токен и chat_id берутся из переменных
@@ -42,6 +43,9 @@ except ImportError:
 
 PARTIAL = (".crdownload", ".part", ".partial", ".tmp", ".download", ".opdownload", ".!ut")
 SKIP_DIRS = ("_КАРАНТИН",)
+# подпапки главной папки, за которыми следим дополнительно (если существуют).
+# Telegram Desktop сохраняет вложения в Downloads\Telegram Desktop, корень Downloads их не видит.
+EXTRA_SUBDIRS = ("Telegram Desktop",)
 
 
 # лог лежит НЕ в наблюдаемой папке, а на уровень выше папки скрипта: C:\Tools\triage.log
@@ -95,8 +99,10 @@ def stable(path, wait=2.0):
         return False
 
 
-def handle(folder, path, opts):
+def handle(root, path, opts):
+    """root - главная папка: в ней лежит _КАРАНТИН; path может быть и в её подпапке."""
     name = os.path.basename(path)
+    shown = os.path.relpath(path, root) if path.startswith(root) else path  # "Telegram Desktop\имя" для подпапки
     t = file_triage.Triage(path)
     try:
         verdict = t.run(opts["defender"])
@@ -105,10 +111,10 @@ def handle(folder, path, opts):
         t.add("УВАГА", "triage", "ошибка разбора %r - считать подозрительным" % e)
     res = file_triage.report(t, verdict, as_json=True)
     real = [f for f in res["findings"] if f["severity"] != "ІНФО"]
-    log(folder, "%s | %s | %d находок" % (verdict, name, len(real)))
+    log(root, "%s | %s | %d находок" % (verdict, shown, len(real)))
     if verdict == "ЧИСТО" and not opts["all"]:
         return
-    lines = ["%s\n" % name]
+    lines = ["%s\n" % shown]
     for f in real[:12]:
         lines.append("[%s] %s: %s" % (f["severity"], f["where"], f["reason"]))
         if f["sample"]:
@@ -118,13 +124,15 @@ def handle(folder, path, opts):
     lines.append("\nSHA256: %s" % res["sha256"])
     moved = ""
     if verdict == "НЕБЕЗПЕЧНО" and opts["quarantine"]:
-        qdir = os.path.join(folder, "_КАРАНТИН")
+        qdir = os.path.join(root, "_КАРАНТИН")
         os.makedirs(qdir, exist_ok=True)
         dst = os.path.join(qdir, name + ".blocked")
+        if os.path.exists(dst):  # одноимённый файл уже в карантине - не затирать
+            dst = os.path.join(qdir, "%s.%s.blocked" % (name, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
         try:
             shutil.move(path, dst)
             moved = "\nФайл перенесён в карантин:\n%s" % dst
-            log(folder, "карантин: %s" % dst)
+            log(root, "карантин: %s" % dst)
         except Exception as e:
             moved = "\nПеренести в карантин не удалось: %s" % e
     action = {"НЕБЕЗПЕЧНО": "НЕ ОТКРЫВАТЬ. Проверить хеш на virustotal.com или отдать файл Клоду на разбор.",
@@ -140,38 +148,48 @@ def main(argv):
     opts = {"quarantine": "--quarantine" in argv, "defender": "--defender" in argv,
             "all": "--all" in argv, "telegram": "--telegram" in argv}
     args = [a for a in argv[1:] if not a.startswith("--")]
-    folder = args[0] if args else os.path.join(os.path.expanduser("~"), "Downloads")
-    if not os.path.isdir(folder):
-        print("нет папки: %s" % folder)
+    if args:
+        folders = [os.path.abspath(a) for a in args]
+    else:
+        root = os.path.join(os.path.expanduser("~"), "Downloads")
+        folders = [root] + [os.path.join(root, sub) for sub in EXTRA_SUBDIRS if os.path.isdir(os.path.join(root, sub))]
+    root = folders[0]  # главная папка: карантин лежит в ней
+    missing = [f for f in folders if not os.path.isdir(f)]
+    if missing:
+        print("нет папки: %s" % "; ".join(missing))
         return 2
-    log(folder, "старт слежения: %s (карантин=%s, defender=%s, telegram=%s)" %
-        (folder, opts["quarantine"], opts["defender"], opts["telegram"]))
-    seen = set(os.listdir(folder))
+    log(root, "старт слежения: %s (карантин=%s, defender=%s, telegram=%s)" %
+        ("; ".join(folders), opts["quarantine"], opts["defender"], opts["telegram"]))
+    seen = {f: set(os.listdir(f)) for f in folders}
     pending = {}
     while True:
         try:
-            now = set(os.listdir(folder))
-            for name in now - seen:
-                if name.lower().endswith(PARTIAL) or name.startswith(("~$", "_triage")) or name in SKIP_DIRS:
+            for folder in folders:
+                try:
+                    now = set(os.listdir(folder))
+                except FileNotFoundError:  # папку удалили/переименовали - ждём, пока вернётся
                     continue
-                p = os.path.join(folder, name)
-                if os.path.isfile(p):
-                    pending[p] = time.time()
-            seen = now
+                for name in now - seen[folder]:
+                    if name.lower().endswith(PARTIAL) or name.startswith(("~$", "_triage")) or name in SKIP_DIRS:
+                        continue
+                    p = os.path.join(folder, name)
+                    if os.path.isfile(p):
+                        pending[p] = time.time()
+                seen[folder] = now
             for p in list(pending):
                 if not os.path.exists(p):
                     pending.pop(p, None)
                     continue
                 if stable(p):
                     pending.pop(p, None)
-                    handle(folder, p, opts)
+                    handle(root, p, opts)
                 elif time.time() - pending[p] > 600:
                     pending.pop(p, None)
         except KeyboardInterrupt:
-            log(folder, "остановлено")
+            log(root, "остановлено")
             return 0
         except Exception as e:
-            log(folder, "ошибка цикла: %r" % e)
+            log(root, "ошибка цикла: %r" % e)
         time.sleep(3)
 
 
