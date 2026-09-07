@@ -18,7 +18,9 @@ watch_downloads.py v1.0 (07.09.2026) - карантин-лаборатория �
     --telegram     слать вердикт в Telegram; токен и chat_id берутся из переменных
                    окружения TRIAGE_TG_TOKEN и TRIAGE_TG_CHAT
 Автозапуск: Планировщик заданий -> "При входе в систему" -> pythonw.exe watch_downloads.py --quarantine
-Остановить: Ctrl+C в консоли или завершить pythonw.exe.
+Страховка: второе задание раз в 3 часа запускает ту же команду; если сторож жив, новый экземпляр
+сразу выходит (именованный mutex), если упал - поднимается заново. Оба задания ставит install_watch.bat.
+Остановить: Ctrl+C в консоли или завершить pythonw.exe (см. remove_watch.bat).
 
 Что НЕ делает: не открывает файлы, не лечит, не подменяет антивирус. Это второй глаз.
 """
@@ -60,6 +62,22 @@ def log(folder, msg):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+_MUTEX = None
+
+
+def single_instance():
+    """True, если это единственный экземпляр сторожа. Второй (например, из задания-keepalive,
+    которое раз в 3 часа пытается запустить сторож заново) тихо выходит. Именованный mutex
+    Windows освобождается системой при смерти процесса, поэтому после падения новый стартует."""
+    global _MUTEX
+    if os.name != "nt":
+        return True
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    _MUTEX = k32.CreateMutexW(None, False, "Global\\Triage-Downloads-Watch")
+    return k32.GetLastError() != 183  # 183 = ERROR_ALREADY_EXISTS
 
 
 def popup(title, text):
@@ -148,6 +166,8 @@ def main(argv):
     opts = {"quarantine": "--quarantine" in argv, "defender": "--defender" in argv,
             "all": "--all" in argv, "telegram": "--telegram" in argv}
     args = [a for a in argv[1:] if not a.startswith("--")]
+    if not single_instance():
+        return 0  # сторож уже работает - молча уходим, в лог не пишем, чтобы не засорять
     if args:
         folders = [os.path.abspath(a) for a in args]
     else:
