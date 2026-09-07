@@ -3,7 +3,8 @@
 """
 watch_downloads.py v1.0 (07.09.2026) - карантин-лаборатория для папки Загрузки.
 Следит за папкой, каждый новый файл прогоняет через file_triage.py (лежит рядом)
-и, если вердикт УВАГА/НЕБЕЗПЕЧНО, показывает окно с находками, пишет в лог,
+и, если вердикт УВАГА/НЕБЕЗПЕЧНО, показывает окно с находками, пишет в лог
+(C:\\Tools\\triage.log, на уровень выше папки скрипта),
 при желании переносит файл в карантин и шлёт сообщение в Telegram.
 
 Запуск (Windows, без зависимостей кроме Python; oletools - по желанию):
@@ -43,11 +44,15 @@ PARTIAL = (".crdownload", ".part", ".partial", ".tmp", ".download", ".opdownload
 SKIP_DIRS = ("_КАРАНТИН",)
 
 
+# лог лежит НЕ в наблюдаемой папке, а на уровень выше папки скрипта: C:\Tools\triage.log
+LOG_PATH = os.path.join(os.path.dirname(HERE), "triage.log")
+
+
 def log(folder, msg):
     line = "%s  %s" % (datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"), msg)
     print(line, flush=True)
     try:
-        with open(os.path.join(folder, "_triage.log"), "a", encoding="utf-8") as f:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
