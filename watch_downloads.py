@@ -22,16 +22,23 @@ watch_downloads.py v1.0 (07.09.2026) - карантин-лаборатория �
 сразу выходит (именованный mutex), если упал - поднимается заново. Оба задания ставит install_watch.bat.
 Остановить: Ctrl+C в консоли или завершить pythonw.exe (см. remove_watch.bat).
 
+Белый список: allow.txt рядом со скриптом. Файл из списка пропускается без окна и карантина.
+Строка = SHA256 файла (точечно) или «издатель: Имя» (любая программа с действительной подписью
+этого издателя). Проще всего добавлять перетаскиванием файла на разрешить.bat.
+
 Что НЕ делает: не открывает файлы, не лечит, не подменяет антивирус. Это второй глаз.
 """
 
 import os
+import re
 import sys
 import time
 import json
 import shutil
+import hashlib
 import threading
 import datetime
+import subprocess
 import urllib.request
 import urllib.parse
 
@@ -52,6 +59,92 @@ EXTRA_SUBDIRS = ("Telegram Desktop",)
 
 # лог лежит НЕ в наблюдаемой папке, а на уровень выше папки скрипта: C:\Tools\triage.log
 LOG_PATH = os.path.join(os.path.dirname(HERE), "triage.log")
+
+# белый список доверенных файлов: C:\Tools\triage\allow.txt (см. шапку самого файла).
+# Читается заново на каждый файл, поэтому правки применяются без перезапуска сторожа.
+ALLOW_PATH = os.path.join(HERE, "allow.txt")
+# расширения, у которых вообще бывает цифровая подпись Authenticode: только их проверяем на подпись
+SIGNED_EXT = (".exe", ".dll", ".msi", ".msp", ".cab", ".sys", ".ocx", ".ps1", ".appx", ".msix", ".cat")
+
+
+def load_allow(path=None):
+    """Читает allow.txt. Возвращает (хеши SHA256, издатели, нераспознанные строки)."""
+    hashes, publishers, junk = set(), set(), []
+    try:
+        with open(path or ALLOW_PATH, encoding="utf-8-sig") as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                low = line.lower()
+                key = next((k for k in ("издатель:", "видавець:", "publisher:") if low.startswith(k)), None)
+                if key:
+                    name = line[len(key):].strip().strip('"')
+                    if name:
+                        publishers.add(name.lower())
+                    continue
+                if re.fullmatch(r"[0-9a-fA-F]{64}", line):
+                    hashes.add(low)
+                else:
+                    junk.append(line[:80])
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        junk.append("файл не прочитан: %r" % e)
+    return hashes, publishers, junk
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except Exception:
+        return None
+    return h.hexdigest()
+
+
+def signature_cn(path):
+    """Имя издателя из ДЕЙСТВИТЕЛЬНОЙ цифровой подписи файла или None.
+    Файл при этом не запускается: Windows только читает его байты и проверяет сертификат.
+    Путь передаётся через переменную окружения, чтобы кавычки в имени файла ничего не сломали."""
+    if os.name != "nt":
+        return None
+    ps = ("$ErrorActionPreference='SilentlyContinue';"
+          "$s = Get-AuthenticodeSignature -LiteralPath $env:TRIAGE_SIG_FILE;"
+          "if ($s.Status -eq 'Valid') { $s.SignerCertificate.Subject }")
+    try:
+        env = dict(os.environ, TRIAGE_SIG_FILE=os.path.abspath(path))
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, text=True, timeout=90, env=env).stdout
+    except Exception:
+        return None
+    m = re.search(r"CN=([^,]+)", out or "")
+    return m.group(1).strip().strip('"') if m else None
+
+
+def may_be_signed(path):
+    """Бывает ли у такого файла подпись. Суффикс карантина .blocked не мешает: подпись лежит
+    внутри самого файла, а не в его имени, поэтому смотрим расширение под суффиксом."""
+    low = path.lower()
+    if low.endswith(".blocked"):
+        low = low[:-len(".blocked")]
+    return low.endswith(SIGNED_EXT)
+
+
+def allowed(path, allow_path=None):
+    """(True, причина), если файл в белом списке. Сначала точный хеш, затем издатель подписи."""
+    hashes, publishers, _ = load_allow(allow_path)
+    if hashes:
+        h = sha256_file(path)
+        if h and h in hashes:
+            return True, "белый список: SHA256"
+    if publishers and may_be_signed(path):
+        cn = signature_cn(path)
+        if cn and cn.lower() in publishers:
+            return True, "белый список: подпись %s" % cn
+    return False, ""
 
 
 def log(folder, msg):
@@ -121,6 +214,10 @@ def handle(root, path, opts):
     """root - главная папка: в ней лежит _КАРАНТИН; path может быть и в её подпапке."""
     name = os.path.basename(path)
     shown = os.path.relpath(path, root) if path.startswith(root) else path  # "Telegram Desktop\имя" для подпапки
+    ok, why = allowed(path)
+    if ok:
+        log(root, "ДОВІРЕНО | %s | %s" % (shown, why))
+        return
     t = file_triage.Triage(path)
     try:
         verdict = t.run(opts["defender"])
@@ -180,6 +277,10 @@ def main(argv):
         return 2
     log(root, "старт слежения: %s (карантин=%s, defender=%s, telegram=%s)" %
         ("; ".join(folders), opts["quarantine"], opts["defender"], opts["telegram"]))
+    hashes, publishers, junk = load_allow()
+    log(root, "белый список %s: хешей %d, издателей %d%s" %
+        (ALLOW_PATH, len(hashes), len(publishers),
+         (", НЕ РАЗОБРАНО строк %d (первая: %s)" % (len(junk), junk[0])) if junk else ""))
     seen = {f: set(os.listdir(f)) for f in folders}
     pending = {}
     while True:
