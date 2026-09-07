@@ -171,13 +171,24 @@ def allow_add_hash(sha, note=""):
     return True
 
 
+def yes_no_labels():
+    """Подписи кнопок окна. Их рисует сама Windows на языке системы, поэтому в тексте окна
+    надо называть их теми же словами, иначе выйдет «нажмите Так», а на кнопке «Да»."""
+    try:
+        import ctypes
+        lang = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF
+    except Exception:
+        lang = 0
+    return {0x19: ("Да", "Нет"), 0x22: ("Так", "Ні")}.get(lang, ("Yes", "No"))
+
+
 def restore_from_quarantine(path):
-    """Возвращает файл из карантина в наблюдаемую папку, снимая суффикс .blocked.
+    """Возвращает файл из карантина в наблюдаемую папку, снимая суффикс .blocked, если он есть.
     Возвращает новый путь или None, если файл лежит не в карантине."""
     folder, name = os.path.split(path)
-    if not name.lower().endswith(".blocked") or os.path.basename(folder) != SKIP_DIRS[0]:
+    if os.path.basename(folder) != SKIP_DIRS[0]:
         return None
-    base = name[:-len(".blocked")]
+    base = name[:-len(".blocked")] if name.lower().endswith(".blocked") else name
     target_dir = os.path.dirname(folder)
     dst = os.path.join(target_dir, base)
     stem, ext = os.path.splitext(base)
@@ -246,9 +257,9 @@ def popup(title, text):
         print("[POPUP] %s\n%s" % (title, text))
 
 
-def popup_ask(title, text, on_yes):
-    """Окно с кнопками «Так» и «Ні». При «Так» вызывается on_yes().
-    Кнопка по умолчанию – «Ні» (0x100), чтобы случайный Enter ничего не разрешил.
+def popup_ask(title, text, on_yes, on_no=None):
+    """Окно с кнопками «Да» и «Нет» (подписи ставит Windows, см. yes_no_labels).
+    Кнопка по умолчанию – вторая (0x100), чтобы случайный Enter ничего не разрешил.
     Окно живёт в отдельном потоке: сторож продолжает следить за папками, пока оно открыто."""
     if os.name != "nt":
         print("[POPUP?] %s\n%s" % (title, text))
@@ -259,13 +270,49 @@ def popup_ask(title, text, on_yes):
         # 0x4 = кнопки Да/Нет, 0x30 = знак предупреждения, 0x100 = по умолчанию вторая кнопка,
         # 0x1000 = поверх всех окон, 0x10000 = вывести окно на передний план
         answer = ctypes.windll.user32.MessageBoxW(0, text, title, 0x4 | 0x30 | 0x100 | 0x1000 | 0x10000)
-        if answer == 6:  # IDYES
-            try:
+        try:
+            if answer == 6:      # IDYES
                 on_yes()
-            except Exception as e:
-                print("кнопка доверия: %r" % e, flush=True)
+            elif on_no:          # IDNO или закрытое окно
+                on_no()
+        except Exception as e:
+            print("окно с вопросом: %r" % e, flush=True)
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def reblock(root, path):
+    """Возвращает файлу в карантине пометку .blocked (ответ «Нет» на вопрос о доверии)."""
+    dst = path + ".blocked"
+    n = 1
+    while os.path.exists(dst):
+        dst = "%s.%d.blocked" % (path, n)
+        n += 1
+    try:
+        shutil.move(path, dst)
+        log(root, "пометка .blocked возвращена | %s" % os.path.basename(dst))
+    except Exception as e:
+        log(root, "не удалось вернуть пометку .blocked (%r) | %s" % (e, os.path.basename(path)))
+
+
+def handle_unblocked(root, path):
+    """Пользователь снял пометку .blocked с файла прямо в карантине. Спрашиваем подтверждение:
+    «Да» – доверять и вернуть в Загрузки, «Нет» – вернуть пометку обратно."""
+    name = os.path.basename(path)
+    yes, no = yes_no_labels()
+    sha = sha256_file(path)
+    log(root, "снята пометка в карантине | %s | жду ответа" % name)
+    text = ("%s\n\n"
+            "Вы сняли пометку .blocked с файла, который лежит в карантине.\n"
+            "Сторож считает этот файл опасным.\n\n"
+            "«%s» = доверять файлу: вернуть его в Загрузки и больше не проверять.\n"
+            "«%s» = вернуть пометку .blocked, файл останется в карантине.\n\n"
+            "SHA256: %s\n\n"
+            "Нажимайте «%s», только если вы сами скачали этот файл с сайта производителя.\n"
+            "Файл из письма или из Telegram доверенным не делать." % (name, yes, no, sha or "не прочитан", yes))
+    popup_ask("Карантин-триаж: подтвердите доверие", text,
+              on_yes=lambda: trust_now(root, path, sha, name),
+              on_no=lambda: reblock(root, path))
 
 
 def telegram(text):
@@ -346,13 +393,14 @@ def handle(root, path, opts):
     if verdict == "ЧИСТО":
         popup("Карантин-триаж: %s" % verdict, text)
         return
-    # кнопка «Так» = файл свой, вернуть и больше про него не спрашивать
+    # кнопка «Да» = файл свой, вернуть и больше про него не спрашивать
+    yes, no = yes_no_labels()
     question = ("\n\nЭто ваша программа или ваш документ?\n"
-                "«Так» = вернуть файл%s и внести в доверенные (%s).\n"
-                "«Ні» = оставить как есть.\n"
-                "Нажимайте «Так», только если вы сами скачали этот файл с сайта производителя.\n"
+                "«%s» = вернуть файл%s и внести в доверенные (%s).\n"
+                "«%s» = оставить как есть.\n"
+                "Нажимайте «%s», только если вы сами скачали этот файл с сайта производителя.\n"
                 "Файл из письма или из Telegram доверенным не делать." %
-                (" из карантина" if now != path else "", os.path.basename(ALLOW_PATH)))
+                (yes, " из карантина" if now != path else "", os.path.basename(ALLOW_PATH), no, yes))
     popup_ask("Карантин-триаж: %s" % verdict, text + question,
               lambda: trust_now(root, now, res["sha256"], shown))
 
@@ -380,6 +428,9 @@ def main(argv):
         (ALLOW_PATH, len(hashes), len(publishers),
          (", НЕ РАЗОБРАНО строк %d (первая: %s)" % (len(junk), junk[0])) if junk else ""))
     seen = {f: set(os.listdir(f)) for f in folders}
+    # за карантином следим отдельно: файл БЕЗ пометки .blocked означает, что пометку сняли вручную
+    qdirs = [os.path.join(f, SKIP_DIRS[0]) for f in folders]
+    seen_q = {d: (set(os.listdir(d)) if os.path.isdir(d) else set()) for d in qdirs}
     pending = {}
     while True:
         try:
@@ -395,6 +446,19 @@ def main(argv):
                     if os.path.isfile(p):
                         pending[p] = time.time()
                 seen[folder] = now
+            for qdir in qdirs:
+                if not os.path.isdir(qdir):
+                    seen_q[qdir] = set()
+                    continue
+                now_q = set(os.listdir(qdir))
+                for name in now_q - seen_q[qdir]:
+                    low = name.lower()
+                    if low.endswith(".blocked") or low.endswith(PARTIAL) or name.startswith("~$"):
+                        continue  # пометка на месте либо файл ещё дописывается: это не снятие пометки
+                    p = os.path.join(qdir, name)
+                    if os.path.isfile(p):
+                        handle_unblocked(root, p)
+                seen_q[qdir] = now_q
             for p in list(pending):
                 if not os.path.exists(p):
                     pending.pop(p, None)
