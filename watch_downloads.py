@@ -24,7 +24,9 @@ watch_downloads.py v1.0 (07.09.2026) - карантин-лаборатория �
 
 Белый список: allow.txt рядом со скриптом. Файл из списка пропускается без окна и карантина.
 Строка = SHA256 файла (точечно) или «издатель: Имя» (любая программа с действительной подписью
-этого издателя). Проще всего добавлять перетаскиванием файла на разрешить.bat.
+этого издателя). В окне предупреждения есть кнопка «Так»: она вносит файл в белый список и тут же
+возвращает его из карантина, без папок и перетаскиваний. Если окно закрыто, то же самое делает
+разрешить.bat (двойной щелчок покажет карантин списком).
 
 Что НЕ делает: не открывает файлы, не лечит, не подменяет антивирус. Это второй глаз.
 """
@@ -147,6 +149,66 @@ def allowed(path, allow_path=None):
     return False, ""
 
 
+def allow_add_hash(sha, note=""):
+    """Дописывает SHA256 в allow.txt. Возвращает True, если строка добавлена."""
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha or ""):
+        return False
+    if sha.lower() in load_allow()[0]:
+        return True
+    tail = b""
+    try:
+        with open(ALLOW_PATH, "rb") as f:
+            tail = f.read()[-1:]
+    except FileNotFoundError:
+        pass
+    try:
+        with open(ALLOW_PATH, "a", encoding="utf-8") as f:
+            if tail and tail != b"\n":
+                f.write("\n")
+            f.write("%s%s\n" % (sha.lower(), ("  # " + note) if note else ""))
+    except Exception:
+        return False
+    return True
+
+
+def restore_from_quarantine(path):
+    """Возвращает файл из карантина в наблюдаемую папку, снимая суффикс .blocked.
+    Возвращает новый путь или None, если файл лежит не в карантине."""
+    folder, name = os.path.split(path)
+    if not name.lower().endswith(".blocked") or os.path.basename(folder) != SKIP_DIRS[0]:
+        return None
+    base = name[:-len(".blocked")]
+    target_dir = os.path.dirname(folder)
+    dst = os.path.join(target_dir, base)
+    stem, ext = os.path.splitext(base)
+    n = 1
+    while os.path.exists(dst):  # одноимённый файл в папке не затираем
+        dst = os.path.join(target_dir, "%s (%d)%s" % (stem, n, ext))
+        n += 1
+    shutil.move(path, dst)
+    return dst
+
+
+def trust_now(root, path, sha, name):
+    """Реакция на кнопку «Доверять» в окне: сперва запись в белый список, только потом возврат
+    файла, иначе сторож увидит его раньше, чем прочитает список, и снова унесёт в карантин."""
+    if not allow_add_hash(sha, "%s, разрешено из окна %s" % (name, datetime.datetime.now().strftime("%d.%m.%Y"))):
+        log(root, "не удалось записать в белый список: %s" % name)
+        popup("Карантин-триаж", "Не удалось записать в белый список:\n%s\n\nФайл оставлен в карантине." % ALLOW_PATH)
+        return
+    where = path
+    try:
+        restored = restore_from_quarantine(path)
+        if restored:
+            where = restored
+    except Exception as e:
+        log(root, "не удалось вернуть из карантина (%r): %s" % (e, name))
+        popup("Карантин-триаж", "Файл внесён в доверенные, но вернуть его из карантина не вышло:\n%s" % e)
+        return
+    log(root, "ДОВІРЕНО вручную | %s | %s" % (name, where))
+    popup("Карантин-триаж: файл доверен", "%s\n\nФайл возвращён:\n%s\n\nБольше про него не спрошу." % (name, where))
+
+
 def log(folder, msg):
     line = "%s  %s" % (datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S"), msg)
     print(line, flush=True)
@@ -174,6 +236,7 @@ def single_instance():
 
 
 def popup(title, text):
+    """Окно с одной кнопкой ОК. Не ждёт ответа, работа сторожа не останавливается."""
     if os.name == "nt":
         import ctypes
         icon = 0x30 if "НЕБЕЗПЕЧНО" in title else 0x40  # warning / info
@@ -181,6 +244,28 @@ def popup(title, text):
                          args=(0, text, title, icon | 0x1000), daemon=True).start()  # 0x1000 = topmost
     else:
         print("[POPUP] %s\n%s" % (title, text))
+
+
+def popup_ask(title, text, on_yes):
+    """Окно с кнопками «Так» и «Ні». При «Так» вызывается on_yes().
+    Кнопка по умолчанию – «Ні» (0x100), чтобы случайный Enter ничего не разрешил.
+    Окно живёт в отдельном потоке: сторож продолжает следить за папками, пока оно открыто."""
+    if os.name != "nt":
+        print("[POPUP?] %s\n%s" % (title, text))
+        return
+
+    def run():
+        import ctypes
+        # 0x4 = кнопки Да/Нет, 0x30 = знак предупреждения, 0x100 = по умолчанию вторая кнопка,
+        # 0x1000 = поверх всех окон, 0x10000 = вывести окно на передний план
+        answer = ctypes.windll.user32.MessageBoxW(0, text, title, 0x4 | 0x30 | 0x100 | 0x1000 | 0x10000)
+        if answer == 6:  # IDYES
+            try:
+                on_yes()
+            except Exception as e:
+                print("кнопка доверия: %r" % e, flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def telegram(text):
@@ -238,6 +323,7 @@ def handle(root, path, opts):
         lines.append("... ещё %d" % (len(real) - 12))
     lines.append("\nSHA256: %s" % res["sha256"])
     moved = ""
+    now = path  # где файл лежит после разбора: на месте или в карантине
     if verdict == "НЕБЕЗПЕЧНО" and opts["quarantine"]:
         qdir = os.path.join(root, "_КАРАНТИН")
         os.makedirs(qdir, exist_ok=True)
@@ -246,6 +332,7 @@ def handle(root, path, opts):
             dst = os.path.join(qdir, "%s.%s.blocked" % (name, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
         try:
             shutil.move(path, dst)
+            now = dst
             moved = "\nФайл перенесён в карантин:\n%s" % dst
             log(root, "карантин: %s" % dst)
         except Exception as e:
@@ -254,9 +341,20 @@ def handle(root, path, opts):
               "УВАГА": "Открывать только через конвертацию в PDF-картинки / в песочнице. Ссылки не нажимать.",
               "ЧИСТО": "По структуре чисто. Антивирус и здравый смысл не отменяются."}[verdict]
     text = "\n".join(lines) + "\n\n" + action + moved
-    popup("Карантин-триаж: %s" % verdict, text)
     if opts["telegram"]:
         telegram("Карантин-триаж: %s\n%s" % (verdict, text))
+    if verdict == "ЧИСТО":
+        popup("Карантин-триаж: %s" % verdict, text)
+        return
+    # кнопка «Так» = файл свой, вернуть и больше про него не спрашивать
+    question = ("\n\nЭто ваша программа или ваш документ?\n"
+                "«Так» = вернуть файл%s и внести в доверенные (%s).\n"
+                "«Ні» = оставить как есть.\n"
+                "Нажимайте «Так», только если вы сами скачали этот файл с сайта производителя.\n"
+                "Файл из письма или из Telegram доверенным не делать." %
+                (" из карантина" if now != path else "", os.path.basename(ALLOW_PATH)))
+    popup_ask("Карантин-триаж: %s" % verdict, text + question,
+              lambda: trust_now(root, now, res["sha256"], shown))
 
 
 def main(argv):
