@@ -367,24 +367,52 @@ class Triage:
             pass
 
     # -------------------------------------------------------------------- pdf
+    @staticmethod
+    def _texty(data, sample=4096, ratio=0.85):
+        """Похоже ли содержимое потока на текст (структура, object stream, скрипт), а не на картинку."""
+        s = data[:sample]
+        if not s:
+            return False
+        good = sum(1 for c in s if 9 <= c <= 13 or 32 <= c < 127)
+        return good / float(len(s)) >= ratio
+
+    def _pdf_searchable(self, raw):
+        """Структура PDF плюс РАСПАКОВАННЫЕ ТЕКСТОВЫЕ потоки, без бинарного содержимого картинок.
+        Сканы (6 МБ сжатого изображения) случайно содержат байты «/JS» и «/AA», и поиск по всему
+        файлу давал НЕБЕЗПЕЧНО на обычном скане (повод: Ткаченко.PDF от сканера Canon, 11.09.2026)."""
+        parts, pos, taken = [], 0, 0
+        for m in re.finditer(rb"(?<!end)stream\r?\n", raw):
+            start = m.end()
+            end = raw.find(b"endstream", start)
+            if end < 0:
+                break
+            parts.append(raw[pos:start])          # структура объектов: её проверяем всегда
+            data = raw[start:end]
+            try:
+                body = zlib.decompress(data)
+            except Exception:
+                body = data                       # поток без сжатия (часто текстовый content stream)
+            if self._texty(body):
+                parts.append(b"\n" + body + b"\n")
+                taken += 1
+            pos = end
+        parts.append(raw[pos:])
+        return b"".join(parts), taken
+
     def scan_pdf(self, path):
         raw = open(path, "rb").read()
         # распаковать потоки, чтобы видеть скрытое в object streams
-        text = raw
+        text, unpacked = self._pdf_searchable(raw)
+        qdf = False
         try:
             out = subprocess.run(["qpdf", "--qdf", "--object-streams=disable", path, "-"],
                                  capture_output=True, timeout=60).stdout
             if out and len(out) > 100:
-                text = out
+                text, extra = self._pdf_searchable(out)
+                unpacked += extra
+                qdf = True
         except Exception:
-            # fallback: расжать FlateDecode вручную
-            chunks = []
-            for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.S):
-                try:
-                    chunks.append(zlib.decompress(m.group(1)))
-                except Exception:
-                    pass
-            text = raw + b"\n".join(chunks)
+            pass
         # /Name с hex-обфускацией (#4A#53 = JS)
         def deobf(b):
             return re.sub(rb"#([0-9A-Fa-f]{2})", lambda m: bytes([int(m.group(1), 16)]), b)
@@ -405,7 +433,7 @@ class Triage:
             n = len(re.findall(pat, t))
             if n:
                 self.add(sev, "pdf", "%s (x%d)" % (why, n))
-        if len(re.findall(rb"/ObjStm", raw)) and text is raw:
+        if re.search(rb"/ObjStm", raw) and not qdf and not unpacked:
             self.add("УВАГА", "pdf", "object streams не распакованы (нет qpdf) - часть структуры не видна")
         # ссылки
         uris = set()
