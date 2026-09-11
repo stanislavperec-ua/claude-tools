@@ -44,6 +44,21 @@ import subprocess
 import urllib.request
 import urllib.parse
 
+def ensure_std_streams():
+    """pythonw.exe работает без консоли, и тогда sys.stdout и sys.stderr равны None.
+    oletools при импорте вызывает sys.stderr.flush() через colorclass и падает на этом,
+    из-за чего КАЖДЫЙ старый .doc получал «olevba не смог разобрать файл» и вердикт УВАГА.
+    Подставляем пустые потоки до первого импорта oletools. Возвращает, что было подменено."""
+    changed = []
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+            changed.append(name)
+    return changed
+
+
+ensure_std_streams()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 try:
