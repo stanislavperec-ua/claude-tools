@@ -171,6 +171,49 @@ def allow_add_hash(sha, note=""):
     return True
 
 
+ORIGIN_DB = "_откуда.json"   # реестр в папке карантина: из какой папки изъят каждый файл
+
+
+def _origin_load(qdir):
+    try:
+        with open(os.path.join(qdir, ORIGIN_DB), encoding="utf-8") as f:
+            db = json.load(f)
+        return db if isinstance(db, dict) else {}
+    except Exception:
+        return {}
+
+
+def _origin_save(qdir, db):
+    # заодно выбрасываем записи про файлы, которых в карантине уже нет
+    db = {k: v for k, v in db.items() if os.path.exists(os.path.join(qdir, k))}
+    try:
+        with open(os.path.join(qdir, ORIGIN_DB), "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print("реестр карантина: %r" % e, flush=True)
+
+
+def remember_origin(qdir, blocked_name, folder, sha=None):
+    """Запоминает, откуда изъят файл, чтобы вернуть его в ту же папку, а не в корень Загрузок."""
+    db = _origin_load(qdir)
+    db[blocked_name] = {"folder": folder, "sha256": sha,
+                        "when": datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")}
+    _origin_save(qdir, db)
+
+
+def origin_folder(qdir, name, sha=None):
+    """Папка, куда возвращать файл. Ищем по имени в карантине, затем по хешу (имя могли изменить
+    вручную, сняв пометку). Если записи нет или папка исчезла, возвращаем папку над карантином."""
+    db = _origin_load(qdir)
+    rec = db.get(name) or db.get(name + ".blocked")
+    if not rec and sha:
+        rec = next((r for r in db.values() if r.get("sha256") == sha), None)
+    folder = (rec or {}).get("folder")
+    if folder and os.path.isdir(folder):
+        return folder
+    return os.path.dirname(qdir)
+
+
 def yes_no_labels():
     """Подписи кнопок окна. Их рисует сама Windows на языке системы, поэтому в тексте окна
     надо называть их теми же словами, иначе выйдет «нажмите Так», а на кнопке «Да»."""
@@ -182,14 +225,15 @@ def yes_no_labels():
     return {0x19: ("Да", "Нет"), 0x22: ("Так", "Ні")}.get(lang, ("Yes", "No"))
 
 
-def restore_from_quarantine(path):
-    """Возвращает файл из карантина в наблюдаемую папку, снимая суффикс .blocked, если он есть.
+def restore_from_quarantine(path, sha=None):
+    """Возвращает файл из карантина ТУДА, ОТКУДА ОН БЫЛ ИЗЪЯТ (файл из подпапки Telegram вернётся
+    в неё, а не в корень Загрузок), снимая суффикс .blocked, если он есть.
     Возвращает новый путь или None, если файл лежит не в карантине."""
-    folder, name = os.path.split(path)
-    if os.path.basename(folder) != SKIP_DIRS[0]:
+    qdir, name = os.path.split(path)
+    if os.path.basename(qdir) != SKIP_DIRS[0]:
         return None
     base = name[:-len(".blocked")] if name.lower().endswith(".blocked") else name
-    target_dir = os.path.dirname(folder)
+    target_dir = origin_folder(qdir, name, sha)
     dst = os.path.join(target_dir, base)
     stem, ext = os.path.splitext(base)
     n = 1
@@ -197,6 +241,10 @@ def restore_from_quarantine(path):
         dst = os.path.join(target_dir, "%s (%d)%s" % (stem, n, ext))
         n += 1
     shutil.move(path, dst)
+    db = _origin_load(qdir)
+    db.pop(name, None)
+    db.pop(name + ".blocked", None)
+    _origin_save(qdir, db)
     return dst
 
 
@@ -209,7 +257,7 @@ def trust_now(root, path, sha, name):
         return
     where = path
     try:
-        restored = restore_from_quarantine(path)
+        restored = restore_from_quarantine(path, sha)
         if restored:
             where = restored
     except Exception as e:
@@ -380,6 +428,7 @@ def handle(root, path, opts):
         try:
             shutil.move(path, dst)
             now = dst
+            remember_origin(qdir, os.path.basename(dst), os.path.dirname(path), res["sha256"])
             moved = "\nФайл перенесён в карантин:\n%s" % dst
             log(root, "карантин: %s" % dst)
         except Exception as e:
@@ -453,8 +502,8 @@ def main(argv):
                 now_q = set(os.listdir(qdir))
                 for name in now_q - seen_q[qdir]:
                     low = name.lower()
-                    if low.endswith(".blocked") or low.endswith(PARTIAL) or name.startswith("~$"):
-                        continue  # пометка на месте либо файл ещё дописывается: это не снятие пометки
+                    if low.endswith(".blocked") or low.endswith(PARTIAL) or name.startswith("~$") or name == ORIGIN_DB:
+                        continue  # пометка на месте, файл ещё дописывается или это служебный реестр
                     p = os.path.join(qdir, name)
                     if os.path.isfile(p):
                         handle_unblocked(root, p)
