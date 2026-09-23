@@ -405,6 +405,35 @@ def stable(path, wait=2.0):
         return False
 
 
+def quarantine_file(root, path, sha=None):
+    """Переносит файл в карантин с пометкой .blocked и запоминает, откуда он изъят.
+    Общая для автоматического переноса (НЕБЕЗПЕЧНО) и для кнопки «Нет» в окне."""
+    qdir = os.path.join(root, SKIP_DIRS[0])
+    os.makedirs(qdir, exist_ok=True)
+    name = os.path.basename(path)
+    dst = os.path.join(qdir, name + ".blocked")
+    if os.path.exists(dst):  # одноимённый файл уже в карантине - не затирать
+        dst = os.path.join(qdir, "%s.%s.blocked" % (name, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
+    shutil.move(path, dst)
+    remember_origin(qdir, os.path.basename(dst), os.path.dirname(path), sha)
+    return dst
+
+
+def deny_now(root, path, sha, name):
+    """Кнопка «Нет»: файл ещё лежит в наблюдаемой папке, убираем его в карантин.
+    Добавлено 23.09.2026: при вердикте УВАГА файл оставался на месте, и кнопка не делала ничего."""
+    try:
+        dst = quarantine_file(root, path, sha)
+    except Exception as e:
+        log(root, "не удалось перенести в карантин по кнопке (%r) | %s" % (e, name))
+        popup("Карантин-триаж", "Перенести файл в карантин не удалось:\n%s" % e)
+        return
+    log(root, "в карантин по кнопке | %s | %s" % (name, dst))
+    popup("Карантин-триаж: файл в карантине",
+          "%s\n\nФайл перенесён в карантин:\n%s\n\nЧтобы вернуть его, снимите пометку .blocked "
+          "или запустите разрешить.bat." % (name, dst))
+
+
 def handle(root, path, opts):
     """root - главная папка: в ней лежит _КАРАНТИН; path может быть и в её подпапке."""
     name = os.path.basename(path)
@@ -435,17 +464,10 @@ def handle(root, path, opts):
     moved = ""
     now = path  # где файл лежит после разбора: на месте или в карантине
     if verdict == "НЕБЕЗПЕЧНО" and opts["quarantine"]:
-        qdir = os.path.join(root, "_КАРАНТИН")
-        os.makedirs(qdir, exist_ok=True)
-        dst = os.path.join(qdir, name + ".blocked")
-        if os.path.exists(dst):  # одноимённый файл уже в карантине - не затирать
-            dst = os.path.join(qdir, "%s.%s.blocked" % (name, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
         try:
-            shutil.move(path, dst)
-            now = dst
-            remember_origin(qdir, os.path.basename(dst), os.path.dirname(path), res["sha256"])
-            moved = "\nФайл перенесён в карантин:\n%s" % dst
-            log(root, "карантин: %s" % dst)
+            now = quarantine_file(root, path, res["sha256"])
+            moved = "\nФайл перенесён в карантин:\n%s" % now
+            log(root, "карантин: %s" % now)
         except Exception as e:
             moved = "\nПеренести в карантин не удалось: %s" % e
     action = {"НЕБЕЗПЕЧНО": "НЕ ОТКРЫВАТЬ. Проверить хеш на virustotal.com или отдать файл Клоду на разбор.",
@@ -459,14 +481,17 @@ def handle(root, path, opts):
         return
     # кнопка «Да» = файл свой, вернуть и больше про него не спрашивать
     yes, no = yes_no_labels()
+    in_quarantine = now != path
     question = ("\n\nЭто ваша программа или ваш документ?\n"
                 "«%s» = вернуть файл%s и внести в доверенные (%s).\n"
-                "«%s» = оставить как есть.\n"
+                "«%s» = %s.\n"
                 "Нажимайте «%s», только если вы сами скачали этот файл с сайта производителя.\n"
                 "Файл из письма или из Telegram доверенным не делать." %
-                (yes, " из карантина" if now != path else "", os.path.basename(ALLOW_PATH), no, yes))
+                (yes, " из карантина" if in_quarantine else "", os.path.basename(ALLOW_PATH),
+                 no, "оставить в карантине" if in_quarantine else "убрать файл в карантин", yes))
     popup_ask("Карантин-триаж: %s" % verdict, text + question,
-              lambda: trust_now(root, now, res["sha256"], shown))
+              lambda: trust_now(root, now, res["sha256"], shown),
+              on_no=None if in_quarantine else (lambda: deny_now(root, path, res["sha256"], shown)))
 
 
 def main(argv):
