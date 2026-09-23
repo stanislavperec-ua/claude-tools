@@ -452,7 +452,11 @@ class Triage:
             uris.add(u)
         self.check_urls(sorted(uris), "pdf (ссылки)")
         pages = len(re.findall(rb"/Type\s*/Page\b", t)) or 1
-        untrusted = [u for u in uris if not re.search(r"://([\w.-]+\.)?(gov\.ua|rada\.gov\.ua|court\.gov\.ua|prozorro\.gov\.ua|nszu\.gov\.ua|ligazakon\.net|zakononline\.com\.ua|reyestr\.court\.gov\.ua|opendatabot\.ua|youcontrol\.com\.ua|clarity-project\.info|prometheus\.org\.ua)(/|$)", u, re.I)]
+        # приманка «документ по ссылке» - это переход и загрузка, поэтому почта и телефон в счёт
+        # не идут (23.09.2026: запрос полиции с адресом mailto:...@hk.police.gov.ua получил УВАГА,
+        # потому что регекс доверенных доменов требует «://», а у mailto его нет)
+        links = [u for u in uris if not re.match(r"\s*(mailto|tel|callto|sms):", u, re.I)]
+        untrusted = [u for u in links if not re.search(r"://([\w.-]+\.)?(gov\.ua|rada\.gov\.ua|court\.gov\.ua|prozorro\.gov\.ua|nszu\.gov\.ua|ligazakon\.net|zakononline\.com\.ua|reyestr\.court\.gov\.ua|opendatabot\.ua|youcontrol\.com\.ua|clarity-project\.info|prometheus\.org\.ua)(/|$)", u, re.I)]
         if pages <= 2 and 1 <= len(untrusted) <= 3 and len(plain.strip()) < 2500:
             self.add("УВАГА", "pdf", "короткий PDF с %d внешней ссылкой(ами) - формат приманки 'документ по ссылке'" % len(untrusted))
         if pages <= 1 and not plain.strip() and b"/Image" in t:
