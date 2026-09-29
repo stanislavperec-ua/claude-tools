@@ -20,6 +20,12 @@ npa_tool.py – єдиний інструмент роботи з НПА із za
 
 Якщо другим аргументом дано ID акта (напр. 2456-17, 1404-19, 76-2023-п), а файлу
 <ID>.txt ще немає – скрипт сам його завантажить.
+ID зі слешем передавати як є: fetch 280/97-вр (файл 280_97-вр.txt). Слеш не кодується
+(до 29.09.2026 кодувався як %2F → HTTP 404).
+
+ЧИННІСТЬ АКТА ЦІЛКОМ (додано 29.09.2026): fetch/report читає шапку акта; примітка
+«{Закон/Кодекс/Постанова/Наказ … втратив(-ла) чинність …}» → рядок [СТОП] АКТ ВТРАТИВ
+ЧИННІСТЬ. Такий акт не цитувати – шукати акт, що його замінив (зазначений у примітці).
 
 ЧОМУ РАНІШЕ «НЕ ВИХОДИЛО» (провал 26.08.2026, Бюджетний кодекс, три спроби)
     zakon.rada.gov.ua віддає відповідь у gzip НАВІТЬ без заголовка Accept-Encoding.
@@ -93,7 +99,7 @@ def fetch_html(npa_id: str) -> tuple[int, bytes]:
     Тому: повний набір заголовків + Referer на картку акта + до 4 спроб
     з паузою."""
     import time
-    qid = urllib.parse.quote(npa_id, safe='')
+    qid = urllib.parse.quote(npa_id, safe='/')   # слеш в ID (280/97-вр) не кодувати
     url = BASE.format(id=qid)
     hdrs = dict(HEADERS, Referer=f"https://zakon.rada.gov.ua/laws/show/{qid}")
     last = None
@@ -113,6 +119,10 @@ def fetch_html(npa_id: str) -> tuple[int, bytes]:
                 print(f"[ЧЕКАЮ] {last} (спроба {attempt + 1}/4), пауза {wait} с …", file=sys.stderr)
                 time.sleep(wait)
                 continue
+            if e.code == 404:
+                print(f"[ПОМИЛКА] HTTP 404 – акт «{npa_id}» не знайдено: звірити ID на zakon.rada "
+                      f"(формат: 2456-17, 280/97-вр, 76-2023-п)", file=sys.stderr)
+                sys.exit(3)
             raise
         except urllib.error.URLError as e:
             last = f"мережа: {e.reason}"
@@ -129,6 +139,11 @@ def html_to_text(page: str) -> str:
     t = html.unescape(re.sub(r"<[^>]+>", "", t))
     t = re.sub(r"[ \t\xa0]+", " ", t)
     return re.sub(r"\n\s*\n+", "\n", t).strip()
+
+
+ACT_DEAD_RE = re.compile(
+    r"\{\s*(?:Закон|Кодекс|Постанова|Наказ|Указ|Розпорядження|Декрет|Положення|Порядок|Рішення|Інструкція|Правила)"
+    r"\s+(?:втратив|втратила|втратило)\s+чинність[^}]*\}")
 
 
 def txt_name(npa_id: str) -> str:
@@ -157,6 +172,14 @@ def report(text: str, out: str) -> None:
     print(f"[РЕДАКЦІЯ] {red.group(0).strip() if red else 'рядок редакції не знайдено – звірити вручну в шапці'}")
     if not arts:
         print("[ПРИМІТКА] структури «Стаття N.» немає – акт з пунктами; шукати через grep")
+    head = text[:4000]
+    m1 = re.search(r"(?m)^(Стаття 1\.|Розділ I\b|1\. )", text)
+    if m1 and m1.start() < 20000:
+        head = text[:m1.start()]
+    dead = ACT_DEAD_RE.search(head)
+    if dead:
+        print(f"[СТОП] АКТ ВТРАТИВ ЧИННІСТЬ: {dead.group(0)[:300]}")
+        print("        Цитувати заборонено – знайти акт, що його замінив (див. примітку), і працювати з ним.")
 
 
 def load(src: str) -> str:
