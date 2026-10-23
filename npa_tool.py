@@ -25,8 +25,20 @@ npa_tool.py – єдиний інструмент роботи з НПА із za
                                                         і які місця скіла (SKILL.md, modules/*.md) на це
                                                         посилаються; з датою – акти змін після неї
     python3 npa_tool.py snapshot <watch.json> [--write]      новий еталон (оновлення скіла в Claude Code)
+    python3 npa_tool.py chromejs <ID> 55 56 п.9-2            JS для Claude in Chrome: витяг цілих статей
+                                                        (пунктів) зі сторінки /print + мінідетектор чинності
+                                                        (коли zakon.rada недоступний з цього середовища)
     Ключ --fresh у будь-якій команді: завантажити акт заново, навіть якщо кеш свіжий.
     Ключ --nth K у point: K-те входження номера пункту (додатки з власною нумерацією).
+    Ключі radar: --budget N (ліміт часу в секундах, типово 60; акти, що не встигли, перелічуються),
+                 --acts ID,ID (перевірити лише ці акти з watch.json, напр. ті, що цитуються в документі).
+
+МЕРЕЖА (додано 23.10.2026, після 26 хвилин на один лист): коли zakon.rada недоступний з цього
+середовища на рівні мережі (не HTTP 429/404), скрипт НЕ ходить по колу. Перед першим завантаженням
+робиться одна швидка перевірка (8 с); далі після 2 мережевих відказів поспіль решта актів не
+качається. Результат – один рядок [МЕРЕЖА] і код виходу 4: одразу Claude in Chrome за рецептом
+модуля 02 (2.2-Chrome), JS друкує команда chromejs. Таймаут запиту 25 с, мережева помилка –
+один повтор через 3 с. Паузи при HTTP 429/302 (антибот) лишилися, бо там сайт відповідає.
 
 Якщо другим аргументом дано ID акта (напр. 2456-17, 1404-19, 76-2023-п), а файлу
 <ID>.txt ще немає – скрипт сам його завантажить.
@@ -84,6 +96,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -91,6 +104,14 @@ import urllib.request
 from datetime import datetime, timedelta
 
 BASE = "https://zakon.rada.gov.ua/laws/show/{id}/print"
+CARD = "https://zakon.rada.gov.ua/laws/show/{id}"
+NET_TIMEOUT = 25          # секунд на один запит (до 23.10.2026 було 90)
+NET_RETRY_PAUSE = 3       # пауза перед єдиним повтором після мережевої помилки (було 10 с × 4 спроби)
+PREFLIGHT_TIMEOUT = 8     # швидка перевірка доступності zakon.rada перед першим завантаженням
+PREFLIGHT_ID = "4651-17"  # КПК: легка картка акта для перевірки
+RADAR_BUDGET = 60         # radar: типовий ліміт часу, секунд (--budget N)
+EXIT_NET = 4              # код виходу: zakon.rada недоступний з цього середовища → Chrome
+NET_HINT = "одразу Claude in Chrome (модуль 02, 2.2-Chrome): npa_tool.py chromejs <ID> <статті>"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -132,26 +153,83 @@ HEADERS = {
 
 
 class FetchError(Exception):
-    pass
+    """net=True: збій на рівні мережі (zakon.rada недоступний звідси), а не відповідь сайту."""
+
+    def __init__(self, message: str, net: bool = False):
+        super().__init__(message)
+        self.net = net
+
+
+class _Net:
+    """Стан мережі в межах одного запуску (спільний для потоків радара)."""
+    lock = threading.Lock()
+    checked = False     # швидку перевірку вже зроблено
+    down = False        # запобіжник: zakon.rada недоступний, нічого більше не качати
+    reason = ""
+    fails = 0           # мережеві відкази поспіль; 2 → down
+    skipped = []        # акти, які не качалися через запобіжник
+
+
+def _net_error(npa_id: str) -> FetchError:
+    return FetchError(f"[МЕРЕЖА] {npa_id}: zakon.rada недоступний з цього середовища ({_Net.reason}) – {NET_HINT}", net=True)
+
+
+def _net_failed(reason: str) -> None:
+    with _Net.lock:
+        _Net.fails += 1
+        _Net.reason = reason
+        if _Net.fails >= 2:
+            _Net.down = True
+
+
+def _preflight() -> bool:
+    """Одна швидка спроба відкрити картку акта. Будь-яка HTTP-відповідь (навіть 429/404)
+    означає, що сайт досяжний; лише мережева помилка вмикає запобіжник."""
+    with _Net.lock:
+        if _Net.checked:
+            return not _Net.down
+        _Net.checked = True
+        req = urllib.request.Request(CARD.format(id=PREFLIGHT_ID), headers=HEADERS)
+        try:
+            with urllib.request.urlopen(req, timeout=PREFLIGHT_TIMEOUT) as r:
+                r.read(1)
+        except urllib.error.HTTPError:
+            pass
+        except (urllib.error.URLError, OSError) as e:
+            _Net.down = True
+            _Net.reason = str(getattr(e, "reason", None) or e)
+            return False
+        return True
 
 
 def _fetch_raw(npa_id: str) -> tuple[int, bytes]:
     """Завантажує /print. Сайт без «браузерних» заголовків ганяє по колу
     302 (/laws/show → /go → /laws/show …) і після серії запитів дає 429.
     Тому: повний набір заголовків + Referer на картку акта + до 4 спроб
-    з паузою. Помилка → FetchError з текстом для користувача."""
+    з паузою при 429/302. Мережева помилка – лише один повтор; після
+    2 відказів поспіль (або провалу швидкої перевірки) – FetchError(net=True)
+    для всіх наступних актів без жодного запиту."""
+    if _Net.down or not _preflight():
+        with _Net.lock:
+            _Net.skipped.append(npa_id)
+        raise _net_error(npa_id)
     qid = urllib.parse.quote(npa_id, safe='/')   # слеш в ID (280/97-вр) не кодувати
     url = BASE.format(id=qid)
     hdrs = dict(HEADERS, Referer=f"https://zakon.rada.gov.ua/laws/show/{qid}")
     last = None
+    net_tries = 0
     for attempt in range(4):
+        if _Net.down:
+            raise _net_error(npa_id)
         req = urllib.request.Request(url, headers=hdrs)
         try:
-            with urllib.request.urlopen(req, timeout=90) as r:
+            with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as r:
                 raw = r.read()
                 code = r.status
             if raw[:2] == b"\x1f\x8b":            # gzip magic – незалежно від заголовків
                 raw = gzip.decompress(raw)
+            with _Net.lock:
+                _Net.fails = 0
             return code, raw
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
@@ -164,14 +242,24 @@ def _fetch_raw(npa_id: str) -> tuple[int, bytes]:
                 raise FetchError(f"[ПОМИЛКА] HTTP 404 – акт «{npa_id}» не знайдено: звірити ID на zakon.rada "
                                  f"(формат: 2456-17, 280/97-вр, 76-2023-п)")
             raise FetchError(f"[ПОМИЛКА] {npa_id}: {last}")
-        except urllib.error.URLError as e:
-            last = f"мережа: {e.reason}"
-            time.sleep(10)
-        except OSError as e:
-            last = f"мережа: {e}"
-            time.sleep(10)
+        except (urllib.error.URLError, OSError) as e:
+            last = f"мережа: {getattr(e, 'reason', None) or e}"
+            _net_failed(str(getattr(e, "reason", None) or e))
+            net_tries += 1
+            if net_tries >= 2:
+                break
+            time.sleep(NET_RETRY_PAUSE)
+    if last and last.startswith("мережа"):
+        raise _net_error(npa_id)
     raise FetchError(f"[ПОМИЛКА] zakon.rada не віддав /print для {npa_id} після 4 спроб ({last}) – "
                      f"переходити до конекторів: Tavily → Firecrawl scrape (1 кредит) → Chrome")
+
+
+def _exit(code: int) -> None:
+    """Вихід без очікування потоків радара, що ще висять на мережі."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 def fetch_html(npa_id: str) -> tuple[int, bytes]:
@@ -179,7 +267,7 @@ def fetch_html(npa_id: str) -> tuple[int, bytes]:
         return _fetch_raw(npa_id)
     except FetchError as e:
         print(str(e), file=sys.stderr)
-        sys.exit(3)
+        sys.exit(EXIT_NET if e.net else 3)
 
 
 def html_to_text(page: str) -> str:
@@ -221,11 +309,13 @@ def save_page(npa_id: str, page: str) -> str:
 
 
 def fetch_page(npa_id: str):
-    """Без sys.exit: HTML-сторінка або None (рядок [ПОМИЛКА] уже надруковано). Для radar/status."""
+    """Без sys.exit: HTML-сторінка або None (рядок [ПОМИЛКА] уже надруковано; мережеві збої
+    радар підсумовує одним рядком [МЕРЕЖА]). Для radar/status."""
     try:
         code, raw = _fetch_raw(npa_id)
     except FetchError as e:
-        print(str(e))
+        if not e.net:
+            print(str(e))
         return None
     page = raw.decode("utf-8", errors="ignore")
     if code != 200 or "<html" not in page[:2000].lower():
@@ -684,11 +774,37 @@ def _page_for_radar(npa_id: str):
     return fetch_page(npa_id)
 
 
-def _pages(ids):
-    """Паралельно, 3 потоки (більше zakon не любить): {ID: html або None}."""
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        return dict(zip(ids, ex.map(_page_for_radar, ids)))
+SKIPPED = object()   # акт не перевірено: вичерпано бюджет часу або спрацював запобіжник мережі
+
+
+def _pages(ids, budget=None):
+    """Паралельно, 3 потоки (більше zakon не любить): {ID: html, None (помилка) або SKIPPED}.
+    budget – ліміт секунд на все; потоки фонові, тому після ліміту скрипт не чекає на них."""
+    import queue
+    todo = queue.Queue()
+    for i in ids:
+        todo.put(i)
+    out, lock, stop = {}, threading.Lock(), threading.Event()
+
+    def worker():
+        while not stop.is_set():
+            try:
+                i = todo.get_nowait()
+            except queue.Empty:
+                return
+            page = _page_for_radar(i)
+            with lock:
+                out[i] = page
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(3, len(ids)))]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + budget if budget else None
+    for t in threads:
+        t.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+    stop.set()
+    with lock:
+        return {i: out.get(i, SKIPPED) for i in ids}
 
 
 def _expiring(watch: dict):
@@ -705,14 +821,26 @@ def _expiring(watch: dict):
     return out
 
 
-def cmd_radar(watch_path: str):
+def cmd_radar(watch_path: str, only=None, budget=RADAR_BUDGET):
+    """only – перелік ID з watch.json (--acts); budget – ліміт секунд (--budget)."""
     w = load_watch(watch_path)
     acts = w["acts"]
-    pages = _pages([a["id"] for a in acts])
-    failed, newer, bad, changed, ksu = [], [], [], [], []
-    print(f"РАДАР скіла {w.get('skill', '?')} | еталон {w.get('snapshot_date', '?')} | актів: {len(acts)}")
+    if only:
+        known = {a["id"] for a in acts}
+        unknown = [i for i in only if i not in known]
+        if unknown:
+            print(f"[ПОМИЛКА] у watch.json немає актів: {', '.join(unknown)} (для них status/article)")
+        acts = [a for a in acts if a["id"] in only]
+    started = time.monotonic()
+    pages = _pages([a["id"] for a in acts], budget)
+    failed, newer, bad, changed, ksu, skipped = [], [], [], [], [], []
+    print(f"РАДАР скіла {w.get('skill', '?')} | еталон {w.get('snapshot_date', '?')} | актів: {len(acts)}"
+          + (f" (вибрано --acts)" if only else ""))
     for a in acts:
         page = pages.get(a["id"])
+        if page is SKIPPED:
+            skipped.append(a["id"])
+            continue
         if not page:
             failed.append(a["id"])
             continue
@@ -756,10 +884,19 @@ def cmd_radar(watch_path: str):
     if newer or changed:
         print(f"[!] Зміни після еталона: {', '.join(sorted(set(newer + changed)))}. Працювати ТІЛЬКИ за живим текстом; "
               f"деталі й зачеплені місця скіла – changes {os.path.basename(watch_path)} <ID>; сказати Стасу, що скіл пора оновити.")
-    elif not failed and not bad:
+    elif not failed and not bad and not skipped and not _Net.down:
         print("Змін після еталона немає.")
+    if _Net.down:
+        unchecked = sorted(set(failed + skipped + _Net.skipped))
+        print(f"[МЕРЕЖА] zakon.rada недоступний з цього середовища ({_Net.reason}); не перевірено актів: "
+              f"{len(unchecked)} ({', '.join(unchecked)}) – {NET_HINT}")
+        _exit(EXIT_NET)
     if failed:
         print(f"[ПОМИЛКА] не отримано: {', '.join(failed)}; дозволені конектори (Tavily → Firecrawl → Chrome).")
+    if skipped:
+        print(f"[БЮДЖЕТ] {budget} с вичерпано за {time.monotonic() - started:.0f} с; не перевірено: {', '.join(skipped)} "
+              f"– за потреби radar --acts {','.join(skipped)} або status; сайт повільний, не недоступний.")
+        _exit(0)
 
 
 def cmd_changes(watch_path: str, act_id=None, since=None):
@@ -771,7 +908,7 @@ def cmd_changes(watch_path: str, act_id=None, since=None):
     found = False
     for a in acts:
         page = pages.get(a["id"])
-        if not page:
+        if not page or page is SKIPPED:
             continue
         text = html_to_text(page)
         refs = amendment_refs(paragraphs(page), a["id"])
@@ -792,7 +929,7 @@ def cmd_snapshot(watch_path: str, write: bool):
     missing = []
     for a in w["acts"]:
         page = pages.get(a["id"])
-        if not page:
+        if not page or page is SKIPPED:
             missing.append(a["id"])
             continue
         text = html_to_text(page)
@@ -817,36 +954,147 @@ def cmd_status(ids):
     pages = _pages(ids)
     for i in ids:
         page = pages.get(i)
-        if not page:
+        if not page or page is SKIPPED:
             print(f"{i:13s} | НЕ ОТРИМАНО")
             continue
         text = html_to_text(page)
         title = re.sub(r"\s+", " ", text[:160]).split("(Текст для друку)")[0][:70]
         print(f"{i:13s} | {title} | {edition_line(text)} | {status_mark(act_status(text))}")
+    _net_summary()
+
+
+def _net_summary():
+    """Після changes/snapshot/status: один рядок [МЕРЕЖА] і код 4, якщо спрацював запобіжник."""
+    if _Net.down:
+        print(f"[МЕРЕЖА] zakon.rada недоступний з цього середовища ({_Net.reason}) – {NET_HINT}")
+        _exit(EXIT_NET)
+
+
+# ---------------------------------------------------------------- chromejs
+def _js_regex(pat: str) -> str:
+    """Шаблон детектора з Python у JS (прапорець u): \\w не знає кирилиці, тому розгортається."""
+    return pat.replace(r"\w", r"[\p{L}\p{N}_]")
+
+
+def chrome_js(npa_id: str, targets) -> str:
+    """JS для javascript_tool Claude in Chrome на сторінці https://zakon.rada.gov.ua/laws/show/<ID>/print:
+    цілі статті (пункти) + редакція і статус + мінідетектор чинності за тими самими шаблонами, що й
+    check (без відсіву приміток про інші статті, тому вердикт може бути суворішим). Результат підміняє
+    сторінку, читати одним get_page_text; сам javascript_tool повертає лише довжину тексту."""
+    arts = [t for t in targets if not t.startswith("п")]
+    pts = [t[1:].lstrip(".").strip() for t in targets if t.startswith("п")]
+    crit = ",\n".join(f"  [String.raw`{_js_regex(p)}`, {json.dumps(n, ensure_ascii=False)}]" for p, n in CRIT)
+    warn = ",\n".join(f"  [String.raw`{_js_regex(p)}`, {json.dumps(n, ensure_ascii=False)}]" for p, n in WARN)
+    defer = _js_regex(DEFER_RE.pattern)
+    return f"""// npa_tool.py chromejs {npa_id}: виконати javascript_tool на /laws/show/{npa_id}/print, потім один get_page_text
+const ID = {json.dumps(npa_id)};
+const ARTS = {json.dumps(arts, ensure_ascii=False)};
+const PTS = {json.dumps(pts, ensure_ascii=False)};
+const CRIT = [
+{crit}
+];
+const WARN = [
+{warn}
+];
+const DEFER = new RegExp(String.raw`{defer}`, "u");
+const T = "\\n" + document.body.innerText.replace(/\\r/g, "") + "\\nСтаття 999999. ";
+function slice(startRe, nextRe, label) {{
+  const m = T.search(startRe);
+  if (m < 0) return "NOT FOUND " + label;
+  const rest = T.slice(m + 1);
+  const nx = rest.slice(1).search(nextRe);
+  return rest.slice(0, nx < 0 ? 6000 : nx + 1).trim();
+}}
+function art(n) {{
+  const e = n.replace(/-/g, "\\\\-");
+  return slice(new RegExp("\\\\nСтаття " + e + "[.¹²³]", "u"), /\\n(Стаття \\d+(-\\d+)?[.¹²³]|Розділ [IVXLC\\d]+|Глава \\d+)/u, "Стаття " + n);
+}}
+function pt(n) {{
+  const e = n.replace(/-/g, "\\\\-");
+  return slice(new RegExp("\\\\n" + e + "\\\\. ", "u"), /\\n\\d+(-\\d+)?\\. /u, "Пункт " + n);
+}}
+function verdict(seg) {{
+  const notes = seg.replace(/\\n/g, " ").match(/\\{{[^}}]+\\}}/g) || [];
+  const stop = [], warn = [];
+  const today = new Date();
+  for (const note of notes) {{
+    const d = note.match(DEFER);
+    if (d) {{
+      const m = d[2].match(/(\\d{{2}})\\.(\\d{{2}})\\.(\\d{{4}})/);
+      const when = m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
+      (when && when > today ? stop : warn).push(["набрання чинності з " + d[2], note]);
+      continue;
+    }}
+    if (/не набра[\\p{{L}}]*\\s+чинності/u.test(note)) {{ stop.push(["НЕ НАБРАЛО ЧИННОСТІ", note]); continue; }}
+    let hit = CRIT.find(([p]) => new RegExp(p, "u").test(note));
+    if (hit) {{ stop.push([hit[1], note]); continue; }}
+    hit = WARN.find(([p]) => new RegExp(p, "u").test(note));
+    warn.push([hit ? hit[1] : "некласифікована примітка: прочитати вручну", note]);
+  }}
+  if (stop.length) return "ВЕРДИКТ: [СТОП] – " + stop.map(([n, t]) => n + " | " + t.slice(0, 240)).join("\\n  ") + "\\n  ЦИТУВАТИ ЗАБОРОНЕНО до ручного розбору кожної примітки (модуль 02, 2-Ч.3).";
+  if (warn.length) return "ВЕРДИКТ: [УВАГА] – " + warn.map(([n, t]) => n + " | " + t.slice(0, 160)).join("\\n  ");
+  return "ВЕРДИКТ: [ЧИСТО] – приміток немає (спецрежими поза статтею перевірити окремо).";
+}}
+const ed = (T.match(/Редакція від \\d\\d\\.\\d\\d\\.\\d{{4}}[^\\n]{{0,120}}/) || [])[0];
+const st = (T.match(/Законодавство України станом на[^\\n]{{0,160}}/) || [])[0];
+let head = "[ДЖЕРЕЛО] zakon.rada /print через Claude in Chrome, " + new Date().toLocaleDateString("uk-UA") + ", акт " + ID;
+head += "\\n[РЕДАКЦІЯ] " + (ed || "рядок редакції не знайдено: відкрити картку /laws/show/" + ID + " і звірити вручну");
+head += "\\n[СТАТУС] " + (st || "статус не зчитано: звірити на картці акта");
+const parts = [head];
+for (const n of ARTS) {{ const s = art(n); parts.push(s + "\\n" + (s.startsWith("NOT FOUND") ? "" : verdict(s))); }}
+for (const n of PTS) {{ const s = pt(n); parts.push(s + "\\n" + (s.startsWith("NOT FOUND") ? "" : verdict(s))); }}
+const out = parts.join("\\n\\n" + "#".repeat(60) + "\\n\\n");
+document.body.innerHTML = "";
+const pre = document.createElement("pre");
+pre.style.whiteSpace = "pre-wrap";
+pre.textContent = out;
+document.body.appendChild(pre);
+out.length;
+"""
+
+
+def cmd_chromejs(npa_id: str, targets):
+    if not targets:
+        sys.exit("chromejs потребує номери статей або пунктів: chromejs 4651-17 55 56 220 | chromejs 76-2023-п п.9-2")
+    norm = [t.replace("Стаття", "").replace("ст.", "").strip().rstrip(".") for t in targets]
+    print(chrome_js(npa_id, norm))
 
 
 # ---------------------------------------------------------------- main
+def _opt(argv, name, default=None):
+    """Значення ключа «--name value» з argv (ключ і значення вилучаються)."""
+    if name not in argv:
+        return default
+    k = argv.index(name)
+    value = argv[k + 1] if k + 1 < len(argv) else default
+    del argv[k:k + 2]
+    return value
+
+
 def main(argv):
     argv = [a for a in argv if a != "--fresh"]
-    nth = 1
-    if "--nth" in argv:
-        k = argv.index("--nth")
-        nth = int(argv[k + 1])
-        del argv[k:k + 2]
+    nth = int(_opt(argv, "--nth", 1))
+    budget = float(_opt(argv, "--budget", RADAR_BUDGET))
+    only = _opt(argv, "--acts")
     if len(argv) >= 2 and argv[1] == "status":
         cmd_status(argv[2:])
         return
     if len(argv) >= 3 and argv[1] == "radar":
-        cmd_radar(argv[2])
+        cmd_radar(argv[2], [i for i in only.split(",") if i] if only else None, budget or None)
         return
     if len(argv) >= 3 and argv[1] == "changes":
         rest = argv[3:]
         since = next((a for a in rest if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", a)), None)
         act = next((a for a in rest if a != since), None)
         cmd_changes(argv[2], act, since)
+        _net_summary()
         return
     if len(argv) >= 3 and argv[1] == "snapshot":
         cmd_snapshot(argv[2], "--write" in argv)
+        _net_summary()
+        return
+    if len(argv) >= 3 and argv[1] == "chromejs":
+        cmd_chromejs(argv[2], argv[3:])
         return
     if len(argv) < 3:
         sys.exit(__doc__)
