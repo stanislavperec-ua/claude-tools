@@ -997,21 +997,33 @@ const WARN = [
 {warn}
 ];
 const DEFER = new RegExp(String.raw`{defer}`, "u");
-const T = "\\n" + document.body.innerText.replace(/\\r/g, "") + "\\nСтаття 999999. ";
+// Складені номери в заголовку статті чи пункту: 135<sup>1</sup>, 13¹ → 135-1, 13-1 (як html_to_text);
+// у тексті норми верхній індекс лишається цифрою, як в innerText.
+for (const s of document.querySelectorAll("sup")) {{
+  const x = s.textContent.trim();
+  if (/^[\\d,\\s-]+$/u.test(x)) s.textContent = "\\uE000" + x.replace(/^-/, "") + "\\uE001";
+}}
+const SUPS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+const T = ("\\n" + document.body.innerText + "\\nСтаття 999999. ")
+  .replace(/\\r/g, "").replace(/[ \\t\\u00a0]+/g, " ").replace(/\\n /g, "\\n")
+  .replace(/(\\n(?:Стаття )?\\d+(?:-\\d+)*)((?:\\uE000[^\\uE001]*\\uE001|[⁰¹²³⁴⁵⁶⁷⁸⁹])+)(?=\\.)/gu,
+    (m, head, idx) => head + idx.replace(/\\uE000([^\\uE001]*)\\uE001/gu, "-$1")
+      .replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]+/gu, u => "-" + [...u].map(c => SUPS.indexOf(c)).join("")))
+  .replace(/\\uE000([^\\uE001]*)\\uE001/gu, "$1");
+// Номер у RegExp з прапорцем u: дефіс не екранувати (\\- там недопустимий), решту спецсимволів екранувати.
+function esc(s) {{ return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, "\\\\$&"); }}
 function slice(startRe, nextRe, label) {{
   const m = T.search(startRe);
   if (m < 0) return "NOT FOUND " + label;
   const rest = T.slice(m + 1);
   const nx = rest.slice(1).search(nextRe);
-  return rest.slice(0, nx < 0 ? 6000 : nx + 1).trim();
+  return rest.slice(0, nx < 0 ? 6000 : nx + 1).split("\\nСтаття 999999. ")[0].trim();
 }}
 function art(n) {{
-  const e = n.replace(/-/g, "\\\\-");
-  return slice(new RegExp("\\\\nСтаття " + e + "[.¹²³]", "u"), /\\n(Стаття \\d+(-\\d+)?[.¹²³]|Розділ [IVXLC\\d]+|Глава \\d+)/u, "Стаття " + n);
+  return slice(new RegExp("\\\\nСтаття " + esc(n) + "\\\\.", "u"), /\\n(Стаття \\d+(-\\d+)*\\.|Розділ [IVXLC\\d]+|Глава \\d+)/u, "Стаття " + n);
 }}
 function pt(n) {{
-  const e = n.replace(/-/g, "\\\\-");
-  return slice(new RegExp("\\\\n" + e + "\\\\. ", "u"), /\\n\\d+(-\\d+)?\\. /u, "Пункт " + n);
+  return slice(new RegExp("\\\\n" + esc(n) + "\\\\. ", "u"), /\\n\\d+(-\\d+)*\\. /u, "Пункт " + n);
 }}
 function verdict(seg) {{
   const notes = seg.replace(/\\n/g, " ").match(/\\{{[^}}]+\\}}/g) || [];
