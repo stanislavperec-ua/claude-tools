@@ -39,6 +39,7 @@ import zlib
 import hashlib
 import zipfile
 import subprocess
+import urllib.parse
 import xml.etree.ElementTree as ET
 
 # ----------------------------------------------------------------- справочники
@@ -100,6 +101,20 @@ MAGIC_FAMILY = {  # какое расширение какой сигнатур�
 
 SEV = {"НЕБЕЗПЕЧНО": 3, "УВАГА": 2, "ІНФО": 1}
 
+# путь на локальный диск: file:///D:\..., file:///D:/..., file:///D|/..., file://localhost/D:/..., D:\...
+# Сетевые пути (file://сервер/..., file:///\\сервер\..., \\сервер\...) сюда не попадают: после
+# «file:///» у них идёт слэш, а не буква диска.
+_LOCAL_FILE_RE = re.compile(r"^\s*(file:///|file://localhost/)?[a-z][:|][\\/]", re.I)
+
+
+def is_local_file_target(target):
+    """True, если ссылка ведёт на файл на локальном диске, а не на сетевой ресурс.
+    Повод (19.11.2026): таблица «Здорова_громада Південне.xlsx» получила НЕБЕЗПЕЧНО из-за связи
+    с книгой на диске D: автора. Утечка пароля Windows (NTLM) возможна только через сетевой путь,
+    а локальный Excel просто не найдёт и предложит обновить связи."""
+    t = urllib.parse.unquote(target or "")
+    return bool(_LOCAL_FILE_RE.match(t)) and not re.match(r"^\s*(file:)?/*\\\\", t, re.I)
+
 
 class Triage:
     def __init__(self, path):
@@ -152,6 +167,10 @@ class Triage:
             self.urls.add(u)
             low = u.lower()
             host = re.sub(r"^[a-z]+://", "", low).split("/")[0].split("?")[0].split(":")[0]
+            if is_local_file_target(u):
+                self.add("ІНФО", where, "ссылка на файл на локальном диске (на компьютере автора документа), "
+                                        "обращения в сеть нет", u)
+                continue
             if low.startswith("file://") or low.startswith("\\\\"):
                 self.add("НЕБЕЗПЕЧНО", where, "ссылка на файловый ресурс (file:// / UNC) - утечка NTLM или загрузка кода", u)
                 continue
@@ -274,6 +293,7 @@ class Triage:
             except ET.ParseError:
                 self.add("УВАГА", n, "битый XML связей")
                 continue
+            ext_targets = []
             for rel in root.iter():
                 if not rel.tag.endswith("Relationship"):
                     continue
@@ -281,16 +301,23 @@ class Triage:
                 rtype = rel.get("Type", "").rsplit("/", 1)[-1]
                 mode = rel.get("TargetMode", "")
                 if mode == "External" or re.match(r"^(https?|file|ftp|\\\\)", target, re.I):
+                    ext_targets.append(target)
                     if rtype in ("attachedTemplate", "oleObject", "package", "frame", "subDocument", "vmlDrawing", "image", "oleObject"):
                         self.add("НЕБЕЗПЕЧНО", n, "внешняя связь типа %s -> загрузка кода при открытии (template injection / CVE-2021-40444-style)" % rtype, target)
                     elif rtype == "hyperlink":
                         self.check_urls([target], n + " (гиперссылка)")
+                    elif is_local_file_target(target):
+                        # связь с книгой на диске автора: след копирования листа, Excel её просто не найдёт
+                        self.add("ІНФО", n, "внешняя связь типа %s на файл на локальном диске автора" % rtype, target)
                     else:
                         self.add("УВАГА", n, "внешняя связь типа %s" % rtype, target)
                         self.check_urls([target], n)
-            # externalLinks в Excel
+            # externalLinks в Excel: если все они ведут на локальные файлы автора, это справка, а не риск
             if "externallink" in n.lower():
-                self.add("УВАГА", n, "внешние ссылки книги Excel")
+                if ext_targets and all(is_local_file_target(x) for x in ext_targets):
+                    self.add("ІНФО", n, "внешние ссылки книги Excel на локальные файлы автора")
+                else:
+                    self.add("УВАГА", n, "внешние ссылки книги Excel")
         # DDE и опасные поля
         for n in names:
             nl = n.lower()
